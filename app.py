@@ -55,6 +55,8 @@ def init_state():
         "chat_histories": {},          # {target_id: [{"role","content","stage"}]}
         "last_warning": "",
         "last_question": "",           # 记忆采集里 AI 出的题
+        "last_question_audio": None,   # 问题对应的 TTS 音频
+        "mem_answer": "",              # 记忆采集里的回答文本
         "temperature": 0.7,
     }
     for k, v in defaults.items():
@@ -143,30 +145,38 @@ with st.sidebar:
     st.caption("家族数字生命记忆系统 · 演示版")
 
     secret_key = get_api_key()
+    secret_tts_key = get_tts_key()
     model = get_model()
     base_url = get_base_url()
 
     if secret_key:
         st.success("✅ 已接入豆包 character 模型")
-        api_key = secret_key
-    else:
-        st.warning("⚠️ 未检测到 Key，可手动填入，或直接体验演示模式")
-        api_key = st.text_input("ARK API Key", type="password", key="manual_key")
+    if secret_tts_key:
+        st.success("✅ 已接入语音合成 2.0")
+    if not secret_key and not secret_tts_key:
+        st.warning("⚠️ 未配置密钥，可点下方「密钥设置」填写，或直接体验演示模式")
+
+    api_key = secret_key
+    tts_key = secret_tts_key
+
+    # 隐藏式密钥设置（默认折叠，密钥不会直接显示）
+    if not (secret_key and secret_tts_key):
+        with st.expander("🔑 密钥设置（隐藏）", expanded=False):
+            if not secret_key:
+                api_key = st.text_input("ARK API Key", type="password", key="manual_key")
+                st.caption("豆包 character 模型（对话）")
+            if not secret_tts_key:
+                tts_key = st.text_input("TTS API Key（可选）", type="password", key="manual_tts_key")
+                st.caption("豆包语音合成 2.0（让数字人开口说话）")
 
     if api_key:
         st.caption(f"模型：{model}")
         st.session_state.temperature = st.slider("回复温度", 0.0, 1.2, st.session_state.temperature)
 
-    # ---- 语音合成（TTS） ----
-    st.divider()
-    st.subheader("🔊 语音合成")
-    secret_tts_key = get_tts_key()
-    if secret_tts_key:
-        tts_key = secret_tts_key
-        st.success("✅ 已接入豆包语音合成 2.0")
-    else:
-        tts_key = st.text_input("TTS API Key（可选）", type="password", key="manual_tts_key")
+    # ---- 语音合成（TTS）设置 ----
     if tts_key:
+        st.divider()
+        st.subheader("🔊 语音合成")
         tts_enabled = st.toggle("开启语音播报", value=True, key="tts_enabled")
         default_speaker = get_tts_speaker()
         default_idx = list(TTS_VOICES.values()).index(default_speaker) if default_speaker in TTS_VOICES.values() else 0
@@ -175,7 +185,6 @@ with st.sidebar:
     else:
         tts_enabled = False
         speaker = DEFAULT_SPEAKER
-        st.caption("未配置 TTS，数字人将以文字回复")
 
     st.divider()
     st.markdown("**📌 使用流程**")
@@ -201,36 +210,53 @@ with tab_mem:
     c1, c2 = st.columns([1, 1])
 
     with c1:
-        st.markdown("**① 让 AI 出一个采访问题**")
+        st.markdown("**① AI 语音提问**")
         stage_sel = st.selectbox("选择要记录的人生阶段", list(STAGE_LABELS.values()), key="mem_stage")
-        if st.button("🎤 提一个关于这个阶段的问题", width="stretch"):
+        if st.button("🎤 让 AI 语音提问", type="primary", width="stretch"):
             with st.spinner("构思问题中…"):
                 q_prompt = [
                     {"role": "system", "content": "你是一位耐心的口述史采访者，正在采访一位老人。你要提出具体、有画面感、能勾起回忆的问题。"},
                     {"role": "user", "content": f"请针对老人的【{stage_sel}】阶段，提 1 个能勾起回忆的具体问题（如上学、工作、家庭、生活细节）。只输出问题本身，不要任何解释。"},
                 ]
                 try:
-                    st.session_state.last_question = chat(q_prompt, api_key, model=model, base_url=base_url, max_tokens=100)
-                except Exception as e:
-                    st.session_state.last_question = f"（演示模式）请讲讲您{stage_sel}时候印象最深的一件事吧。"
+                    q = chat(q_prompt, api_key, model=model, base_url=base_url, max_tokens=100)
+                except Exception:
+                    q = f"（演示模式）请讲讲您{stage_sel}时候印象最深的一件事吧。"
+                st.session_state.last_question = q
+                st.session_state.last_question_audio = None
+                if tts_key:
+                    with st.spinner("合成问题语音…"):
+                        try:
+                            st.session_state.last_question_audio = tts(q, tts_key, speaker=speaker)
+                        except Exception:
+                            st.session_state.last_question_audio = None
+                st.session_state.mem_answer = ""
+                st.rerun()
+
         if st.session_state.last_question:
             st.info(st.session_state.last_question)
+            if st.session_state.last_question_audio:
+                st.audio(st.session_state.last_question_audio, format="audio/mp3", autoplay=True)
+                st.caption("🔊 上面是 AI 用语音提出的问题")
 
-        st.markdown("**② 记录老人的回答**")
-        answer = st.text_area("把老人的回答记在这里（可粘贴/口述转文字）", key="mem_answer", height=140)
-        col_save, col_direct = st.columns(2)
-        with col_save:
-            if st.button("💾 保存这段记忆", type="primary", width="stretch"):
-                if answer.strip():
-                    st.session_state.memories.append(
-                        {"stage": STAGE_TO_KEY[stage_sel], "content": answer.strip()}
-                    )
-                    st.session_state.mem_answer = ""
-                    st.rerun()
-                else:
-                    st.warning("请先输入内容")
-        with col_direct:
-            st.caption("也可以直接在下方「手动添加」")
+        st.markdown("**② 老人语音回答**")
+        st.caption("老人点下方 🎤 录音说话，录音会保存并播放核对；自动转文字需开通「豆包语音识别(ASR)」。")
+        audio_file = st.audio_input("🎤 点击录音（老人直接说话）")
+        if audio_file is not None:
+            st.audio(audio_file.getvalue(), format="audio/wav")
+            st.caption("✅ 已录到声音（可播放核对），请在下方把回答录入成文字")
+
+        answer = st.text_area("回答内容（当前需手动录入；开通语音识别后可自动转写）", key="mem_answer", height=140)
+
+        if st.button("💾 保存这段记忆", type="primary", width="stretch"):
+            if answer.strip():
+                st.session_state.memories.append(
+                    {"stage": STAGE_TO_KEY[stage_sel], "content": answer.strip()}
+                )
+                st.session_state.mem_answer = ""
+                st.rerun()
+            else:
+                st.warning("请先输入或说出内容")
 
     with c2:
         st.markdown("**已采集的记忆**")
