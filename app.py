@@ -399,7 +399,32 @@ with tab_chat:
                 if m.get("stage") and target.get("is_elder"):
                     st.caption(f"🎭 {STAGE_LABELS.get(m['stage'], '')}阶段")
 
+        # 语音输入（录音 → ASR 转文字 → 作为提问）
+        voice_text = None
+        voice = st.audio_input("🎤 语音提问", label_visibility="collapsed")
+        if voice is not None:
+            sig = len(voice.getvalue())
+            if st.session_state.get("_chat_voice_sig") != sig:
+                st.session_state._chat_voice_sig = sig
+                asr_key = get_asr_key() or tts_key
+                if asr_key:
+                    with st.spinner("🎙️ 正在识别语音…"):
+                        try:
+                            pcm = wav_to_pcm16k(voice.getvalue())
+                            transcript = asr(pcm, asr_key)
+                            if transcript.strip():
+                                voice_text = transcript.strip()
+                            else:
+                                st.warning("未识别到内容，请重试")
+                        except Exception as e:
+                            st.warning(f"语音识别失败：{e}")
+                else:
+                    st.info("未配置语音识别 Key，无法使用语音输入")
+
         prompt = st.chat_input(f"和 {target['nickname']} 聊聊吧…")
+
+        if voice_text:
+            prompt = voice_text
 
         if prompt:
             stage = detect_stage(prompt) if target.get("is_elder") else "elderly"
