@@ -10,6 +10,8 @@
 """
 
 import re
+import time
+
 import requests
 
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
@@ -106,24 +108,63 @@ DEFAULT_STORY = (
 )
 
 
-def build_system_prompt(persona: dict) -> str:
-    """根据人格设定构造系统提示词，让模型始终以该人物身份、口吻说话。"""
+def format_memories(memories) -> str:
+    """把记忆列表按人生阶段分组，格式化成可塞进提示词的文本。
+
+    memories: [{"stage": "childhood", "content": "..."}, ...]
+    """
+    if not memories:
+        return ""
+    order = ("childhood", "youth", "middle", "elderly")
+    grouped = {}
+    for m in memories:
+        grouped.setdefault(m.get("stage", "elderly"), []).append(m.get("content", ""))
+    parts = []
+    for s in order:
+        if s in grouped:
+            label = STAGES[s]["label"]
+            parts.append(f"【{label}】" + "；".join(x for x in grouped[s] if x))
+    return "\n".join(parts)
+
+
+def build_system_prompt(persona: dict, memories=None, family=None, user_identity=None) -> str:
+    """根据人格设定构造系统提示词，让模型始终以该人物身份、口吻说话。
+
+    persona:        {"nickname", "name", "age", "relationship", "story"}
+    memories:       记忆银行里的经历列表（塑造数字人的人格与记忆）
+    family:         其他家庭成员列表（让数字人认识自己的家人）
+    user_identity:  正在和数字人说话的人是谁（如「你的孙女小芳」）
+    """
     nick = persona.get("nickname") or persona.get("name") or "张奶奶"
     name = persona.get("name") or nick
     age = persona.get("age") or "80"
     rel = persona.get("relationship") or "家属"
-    story = persona.get("story") or DEFAULT_STORY
-    return (
-        f"你是{nick}（本名{name}），今年{age}岁，是一位和蔼健谈、记性很好的老人。"
-        f"用户是你的{rel}，会来和你聊天，听你讲一生的故事。\n\n"
-        f"你的人生经历（聊到相应年代时请自然地引用这些细节）：\n{story}\n\n"
-        f"说话要求：\n"
-        f"- 第一人称、口语化、亲切自然，像真人聊天，不像念稿。\n"
-        f"- 可以带一点点质朴的方言味，但不难懂，爱用「那时候」「咱」「乖孙」这类词。\n"
-        f"- 每次回答 100～250 字左右，简短有温度。\n"
-        f"- 聊到某个年龄段的事，就自然地讲那个年代的细节、场景和感受。\n"
+    story = persona.get("story") or ""
+
+    mem_text = format_memories(memories or [])
+    if not mem_text and story:
+        mem_text = story
+    if not mem_text:
+        mem_text = DEFAULT_STORY
+
+    blocks = [
+        f"你是{nick}（本名{name}），今年{age}岁，是一位和蔼健谈、记性很好的老人。",
+        f"你的人生经历（这些是家人记录下来的你的真实记忆，请自然地在对话中引用这些细节）：\n{mem_text}",
+    ]
+    if family:
+        fam = "、".join((m.get("nickname") or m.get("name")) for m in family)
+        blocks.append(f"你的家人：{fam}。你可以自然地提到他们。")
+    if user_identity:
+        blocks.append(f"现在正在和你说话的人是：{user_identity}。请用合适的称呼、以家人的口吻与 TA 聊天。")
+    blocks.append(
+        "说话要求：\n"
+        "- 第一人称、口语化、亲切自然，像真人聊天，不像念稿。\n"
+        "- 可以带一点点质朴的方言味，但不难懂，爱用「那时候」「咱」「乖孙」这类词。\n"
+        "- 每次回答 100～250 字左右，简短有温度。\n"
+        "- 聊到某个年龄段的事，就自然地讲那个年代的细节、场景和感受。\n"
         f"- 始终以「{nick}」的身份说话，不要跳出角色，不要说「我是 AI」。"
     )
+    return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +179,12 @@ FALLBACK_REPLIES = {
 
 
 def chat(messages, api_key, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL,
-         temperature=0.7, max_tokens=800, timeout=60):
+         temperature=0.7, max_tokens=800, timeout=60, max_retries=3):
     """调用豆包(火山方舟) OpenAI 兼容的 chat/completions 接口。
 
     messages: [{"role": "system"|"user"|"assistant", "content": str}, ...]
     返回模型生成的文本；出错时抛出 RuntimeError。
+    对网络抖动（SSL 断连/连接重置）自动重试，提升演示稳定性。
     """
     if not api_key:
         raise RuntimeError("未配置 ARK_API_KEY")
@@ -157,11 +199,23 @@ def chat(messages, api_key, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    resp = requests.post(base_url, json=payload, headers=headers, timeout=timeout)
-    if resp.status_code != 200:
-        raise RuntimeError(f"API 返回 {resp.status_code}: {resp.text[:300]}")
-    data = resp.json()
-    try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"API 返回结构异常: {e}")
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(base_url, json=payload, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                try:
+                    return data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, TypeError) as e:
+                    raise RuntimeError(f"API 返回结构异常: {e}")
+            last_err = RuntimeError(f"API 返回 {resp.status_code}: {resp.text[:300]}")
+        except requests.exceptions.RequestException as e:
+            last_err = e
+        if attempt < max_retries - 1:
+            time.sleep(1.0 * (attempt + 1))
+
+    if isinstance(last_err, RuntimeError):
+        raise last_err
+    raise RuntimeError(f"网络异常（已重试 {max_retries} 次）: {last_err}")

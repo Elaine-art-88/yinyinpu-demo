@@ -2,14 +2,16 @@
 """
 忆音谱 · 家族数字生命记忆系统（演示版）
 
-功能：
-1. 跨年龄数字人对话 —— 接入豆包 character 模型，自由对话；
-   问起某个年龄段的事，自动切换到对应的形象与音色（童年/青年/中年/老年）。
-2. 生成寄语 —— 让数字人以某个年龄阶段的口吻给家人说一段话。
-3. 数字族谱 —— 家族记忆结构示意。
+核心功能：
+1. 记忆采集 —— 通过对话记录大家长一生的经历，这些记忆用于塑造数字人的人格与回答。
+2. 数字人对话 —— 接入豆包 character 模型自由对话，问起某个年龄段自动切换形象与音色；
+   预设音频仅作为「各年龄阶段音色样例」参考（真实语音合成 TTS 为正式版功能）。
+3. 家族树 —— 可编辑，家族成员可增删改；成员之间可生成相互对话。
 
 密钥来源优先级：Streamlit Secrets -> 侧边栏手动输入 -> 演示模式（兜底回复）。
 """
+
+import json
 
 import streamlit as st
 
@@ -24,22 +26,38 @@ from ark_client import (
 )
 
 # ---------------------------------------------------------------------------
-# 页面与 session 初始化
+# 常量与 session 初始化
 # ---------------------------------------------------------------------------
+STAGE_LABELS = {"childhood": "童年", "youth": "青年", "middle": "中年", "elderly": "老年"}
+STAGE_TO_KEY = {v: k for k, v in STAGE_LABELS.items()}
+STAGE_ORDER = ("childhood", "youth", "middle", "elderly")
+
 st.set_page_config(page_title="忆音谱 · 跨年龄数字人", page_icon="👴", layout="wide")
 
-for key, default in {
-    "p_nickname": "张奶奶",
-    "p_name": "张秀兰",
-    "p_age": "80",
-    "p_relationship": "家属",
-    "p_story": "",
-    "messages": [],
-    "photo": None,
-    "last_warning": "",
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+
+def init_state():
+    defaults = {
+        # 家族成员：第一项固定为大家长（数字人主体）
+        "members": [
+            {
+                "id": 0, "name": "张秀兰", "nickname": "张奶奶",
+                "relationship": "大家长/母亲", "age": "80",
+                "photo": None, "memory": "", "is_elder": True,
+            }
+        ],
+        "next_member_id": 1,
+        "memories": [],               # 记忆银行：{"stage","content"}
+        "chat_histories": {},          # {target_id: [{"role","content","stage"}]}
+        "last_warning": "",
+        "last_question": "",           # 记忆采集里 AI 出的题
+        "temperature": 0.7,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+init_state()
 
 
 def get_api_key() -> str:
@@ -63,21 +81,43 @@ def get_base_url() -> str:
         return DEFAULT_BASE_URL
 
 
-def get_persona() -> dict:
+def member_by_id(tid: int):
+    for m in st.session_state.members:
+        if m["id"] == tid:
+            return m
+    return st.session_state.members[0]
+
+
+def member_by_nickname(nick: str):
+    for m in st.session_state.members:
+        if m["nickname"] == nick:
+            return m
+    return None
+
+
+def get_history(tid: int):
+    return st.session_state.chat_histories.setdefault(tid, [])
+
+
+def member_persona(m) -> dict:
     return {
-        "nickname": st.session_state.p_nickname,
-        "name": st.session_state.p_name,
-        "age": st.session_state.p_age,
-        "relationship": st.session_state.p_relationship,
-        "story": st.session_state.p_story,
+        "nickname": m["nickname"],
+        "name": m["name"],
+        "age": m.get("age", ""),
+        "relationship": m["relationship"],
+        "story": m.get("memory", ""),
     }
 
 
-STAGE_TO_KEY = {"童年": "childhood", "青年": "youth", "中年": "middle", "老年": "elderly"}
+def build_member_prompt(m, user_identity=None) -> str:
+    persona = member_persona(m)
+    memories = st.session_state.memories if m.get("is_elder") else None
+    family = [x for x in st.session_state.members if x["id"] != m["id"]]
+    return build_system_prompt(persona, memories=memories, family=family, user_identity=user_identity)
 
 
 # ---------------------------------------------------------------------------
-# 侧边栏：密钥、人格设定、照片上传
+# 侧边栏
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("🧭 忆音谱")
@@ -96,35 +136,11 @@ with st.sidebar:
 
     if api_key:
         st.caption(f"模型：{model}")
-        st.caption("温度：")
-        temperature = st.slider("temperature", 0.0, 1.2, 0.7, key="temperature")
-    else:
-        temperature = 0.7
+        st.session_state.temperature = st.slider("回复温度", 0.0, 1.2, st.session_state.temperature)
 
     st.divider()
-
-    st.subheader("👤 数字人设定")
-    st.text_input("称呼（如：张奶奶）", key="p_nickname")
-    st.text_input("本名", key="p_name")
-    st.text_input("年龄", key="p_age")
-    st.text_input("与你的关系（如：我的奶奶）", key="p_relationship")
-    st.text_area(
-        "人生故事（可留空，使用默认人物故事）",
-        key="p_story",
-        height=120,
-        placeholder="例如：\n- 童年……\n- 青年……\n- 中年……\n- 老年……",
-    )
-
-    st.subheader("📷 上传老人近照")
-    uploaded = st.file_uploader(
-        "上传一张照片（作为当前老年阶段形象，可选）",
-        type=["jpg", "jpeg", "png"],
-        key="photo_uploader",
-    )
-    if uploaded is not None:
-        st.session_state.photo = uploaded.getvalue()
-        st.image(st.session_state.photo, caption="已上传照片", width="stretch")
-
+    st.markdown("**📌 使用流程**")
+    st.caption("1️⃣ 先到「记忆采集」记录大家长的经历\n2️⃣ 再到「家族树」添加家人\n3️⃣ 最后到「数字人对话」和家人聊天")
     st.divider()
     st.caption("🏆 第十四届全国大学生数字媒体科技作品竞赛")
 
@@ -132,164 +148,285 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # 主区域
 # ---------------------------------------------------------------------------
-tab_dialog, tab_message, tab_tree = st.tabs(
-    ["✨ 跨年龄数字人对话", "💝 生成寄语", "🌳 数字族谱"]
+tab_mem, tab_chat, tab_tree, tab_meet = st.tabs(
+    ["📝 记忆采集", "💬 数字人对话", "🌳 家族树", "🗣️ 成员互聊"]
 )
 
+elder = member_by_id(0)
 
-def current_stage() -> str:
-    """取最近一条用户消息对应的阶段，无历史则默认老年。"""
-    if st.session_state.messages:
-        return st.session_state.messages[-1].get("stage", "elderly")
-    return "elderly"
+# ============================== 记忆采集 ====================================
+with tab_mem:
+    st.markdown("#### 记录大家长的一生经历")
+    st.caption("通过对话记录老人的经历，这些记忆会「拷贝」给数字人，塑造 TA 的人格与回答。")
 
+    c1, c2 = st.columns([1, 1])
 
-def render_portrait(stage: str):
-    cfg = STAGES[stage]
-    if stage == "elderly" and st.session_state.photo is not None:
-        st.image(
-            st.session_state.photo,
-            caption="老年阶段 · 数字人形象（你上传的照片）",
+    with c1:
+        st.markdown("**① 让 AI 出一个采访问题**")
+        stage_sel = st.selectbox("选择要记录的人生阶段", list(STAGE_LABELS.values()), key="mem_stage")
+        if st.button("🎤 提一个关于这个阶段的问题", width="stretch"):
+            with st.spinner("构思问题中…"):
+                q_prompt = [
+                    {"role": "system", "content": "你是一位耐心的口述史采访者，正在采访一位老人。你要提出具体、有画面感、能勾起回忆的问题。"},
+                    {"role": "user", "content": f"请针对老人的【{stage_sel}】阶段，提 1 个能勾起回忆的具体问题（如上学、工作、家庭、生活细节）。只输出问题本身，不要任何解释。"},
+                ]
+                try:
+                    st.session_state.last_question = chat(q_prompt, api_key, model=model, base_url=base_url, max_tokens=100)
+                except Exception as e:
+                    st.session_state.last_question = f"（演示模式）请讲讲您{stage_sel}时候印象最深的一件事吧。"
+        if st.session_state.last_question:
+            st.info(st.session_state.last_question)
+
+        st.markdown("**② 记录老人的回答**")
+        answer = st.text_area("把老人的回答记在这里（可粘贴/口述转文字）", key="mem_answer", height=140)
+        col_save, col_direct = st.columns(2)
+        with col_save:
+            if st.button("💾 保存这段记忆", type="primary", width="stretch"):
+                if answer.strip():
+                    st.session_state.memories.append(
+                        {"stage": STAGE_TO_KEY[stage_sel], "content": answer.strip()}
+                    )
+                    st.session_state.mem_answer = ""
+                    st.rerun()
+                else:
+                    st.warning("请先输入内容")
+        with col_direct:
+            st.caption("也可以直接在下方「手动添加」")
+
+    with c2:
+        st.markdown("**已采集的记忆**")
+        if not st.session_state.memories:
+            st.info("还没有记录任何记忆。先从左侧开始采访吧。")
+        for idx, it in enumerate(st.session_state.memories):
+            ctxt, cbtn = st.columns([9, 1])
+            with ctxt:
+                st.markdown(f"**[{STAGE_LABELS[it['stage']]}]** {it['content']}")
+            with cbtn:
+                if st.button("🗑", key=f"delmem_{idx}", help="删除这条记忆"):
+                    del st.session_state.memories[idx]
+                    st.rerun()
+
+    st.divider()
+    col_export, col_import, col_clear = st.columns(3)
+    with col_export:
+        data = {
+            "memories": st.session_state.memories,
+            "members": [
+                {k: v for k, v in m.items() if k != "photo"}
+                for m in st.session_state.members
+            ],
+        }
+        st.download_button(
+            "⬇️ 导出数据（记忆+家族树）",
+            data=json.dumps(data, ensure_ascii=False, indent=2),
+            file_name="yinyinpu_data.json",
+            mime="application/json",
             width="stretch",
         )
-    else:
-        st.image(cfg["portrait"], caption=cfg["desc"], width="stretch")
-    st.markdown(f"### 🎭 当前：{cfg['label']}阶段")
-    st.caption("🔊 该阶段音色（演示版为预设音色，正式版支持音色克隆）")
-    try:
-        st.audio(cfg["voice"])
-    except Exception:
-        st.caption("（音色文件缺失）")
+    with col_import:
+        up = st.file_uploader("导入 JSON", type=["json"], key="import_json", label_visibility="collapsed")
+        if up is not None:
+            try:
+                d = json.loads(up.read())
+                st.session_state.memories = d.get("memories", [])
+                st.session_state.members = d.get("members", st.session_state.members)
+                ids = [m.get("id", 0) for m in st.session_state.members]
+                st.session_state.next_member_id = (max(ids) + 1) if ids else 1
+                st.rerun()
+            except Exception as e:
+                st.error(f"导入失败：{e}")
+    with col_clear:
+        if st.button("🗑 清空全部记忆", width="stretch"):
+            st.session_state.memories = []
+            st.rerun()
 
 
-# ------------------------------- 对话 Tab ---------------------------------
-with tab_dialog:
-    st.markdown("#### 跨年龄数字人对话")
-    st.caption("问起 TA 某个年龄段的事，数字人会【自动切换】到对应的形象与音色 👇")
+# ============================== 数字人对话 ==================================
+with tab_chat:
+    st.markdown("#### 与数字人对话")
+    st.caption("问起某个年龄段的事，数字人会【自动切换】到对应的形象与音色；预设音频仅为「音色样例」。")
 
     if st.session_state.last_warning:
         st.warning(st.session_state.last_warning)
 
+    # 顶部选择：对话对象 / 我是谁
+    top1, top2 = st.columns(2)
+    with top1:
+        nicknames = [m["nickname"] for m in st.session_state.members]
+        target_nick = st.selectbox("🎯 对话对象", nicknames, key="chat_target")
+        target = member_by_nickname(target_nick) or elder
+    with top2:
+        me_opts = ["家属（不指定）"] + [m["nickname"] for m in st.session_state.members if m["id"] != target["id"]]
+        me_sel = st.selectbox("🙋 我是谁", me_opts, key="my_identity")
+        user_identity = None if me_sel == "家属（不指定）" else me_sel
+
     col_img, col_chat = st.columns([2, 3])
 
     with col_img:
-        stage_choice = st.selectbox(
-            "人生阶段", ["自动检测", "童年", "青年", "中年", "老年"], index=0
-        )
+        stage_choice = st.selectbox("人生阶段", ["自动检测", "童年", "青年", "中年", "老年"], index=0, key="stage_choice")
+
+        history = get_history(target["id"])
         if stage_choice == "自动检测":
-            render_portrait(current_stage())
+            cur = history[-1].get("stage", "elderly") if history else "elderly"
         else:
-            render_portrait(STAGE_TO_KEY[stage_choice])
+            cur = STAGE_TO_KEY[stage_choice]
 
-    with col_chat:
-        # 历史消息
-        for m in st.session_state.messages:
-            with st.chat_message(m["role"]):
-                st.write(m["content"])
-                st.caption(f"🎭 {STAGES[m.get('stage', 'elderly')]['label']}阶段")
-
-        prompt = st.chat_input("和 TA 聊聊吧，比如：讲讲你小时候上学的故事…")
-
-        if prompt:
-            stage = detect_stage(prompt)
-            st.session_state.messages.append(
-                {"role": "user", "content": prompt, "stage": stage}
-            )
-
-            # 组装 messages（system + 完整历史）
-            msgs = [{"role": "system", "content": build_system_prompt(get_persona())}]
-            for m in st.session_state.messages:
-                msgs.append({"role": m["role"], "content": m["content"]})
-
-            with st.chat_message("assistant"):
-                with st.spinner(f"已切换到【{STAGES[stage]['label']}】阶段，正在回忆…"):
-                    try:
-                        reply = chat(
-                            msgs,
-                            api_key,
-                            model=model,
-                            base_url=base_url,
-                            temperature=temperature,
-                        )
-                        st.session_state.last_warning = ""
-                    except Exception as e:
-                        reply = FALLBACK_REPLIES.get(stage, FALLBACK_REPLIES["elderly"])
-                        st.session_state.last_warning = (
-                            f"⚠️ 当前为演示模式（未成功连接模型）：{e}"
-                        )
-            st.session_state.messages.append(
-                {"role": "assistant", "content": reply, "stage": stage}
-            )
-            st.rerun()
-
-
-# ----------------------------- 生成寄语 Tab -------------------------------
-with tab_message:
-    st.markdown("#### 生成一段寄语")
-    st.caption("让数字人以某个年龄阶段的口吻，给家人说一段话")
-
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        topic = st.text_input(
-            "寄语主题", placeholder="例如：给孙女的祝福 / 对全家人的叮嘱"
-        )
-        stage_sel = st.selectbox("选择阶段", ["老年", "中年", "青年", "童年"], index=0)
-    with c2:
-        st.caption("预览")
-        cfg = STAGES[STAGE_TO_KEY[stage_sel]]
-        if stage_sel == "老年" and st.session_state.photo is not None:
-            st.image(st.session_state.photo, width=180)
-        else:
-            st.image(cfg["portrait"], width=180)
-
-    if st.button("✨ 生成寄语", type="primary"):
-        if not topic.strip():
-            st.warning("请先填写寄语主题")
-        else:
-            stage_key = STAGE_TO_KEY[stage_sel]
-            stage_label = STAGES[stage_key]["label"]
-            msgs = [
-                {"role": "system", "content": build_system_prompt(get_persona())},
-                {
-                    "role": "user",
-                    "content": (
-                        f"请你以【{stage_label}阶段】的口吻，围绕「{topic}」"
-                        f"给家人说一段 150～250 字的寄语，语气真挚、温暖、口语化。"
-                    ),
-                },
-            ]
-            with st.spinner("生成中…"):
-                try:
-                    msg = chat(msgs, api_key, model=model, base_url=base_url)
-                except Exception as e:
-                    msg = FALLBACK_REPLIES.get(stage_key, FALLBACK_REPLIES["elderly"])
-                    st.warning(f"演示模式（未成功连接模型）：{e}")
-
-            st.success(f"🎭 {stage_label}阶段寄语")
-            st.markdown(msg)
+        # 展示形象
+        if target.get("is_elder"):
+            cfg = STAGES[cur]
+            if cur == "elderly" and target.get("photo"):
+                st.image(target["photo"], caption="老年阶段 · 数字人形象（上传的照片）", width="stretch")
+            else:
+                st.image(cfg["portrait"], caption=cfg["desc"], width="stretch")
+            st.markdown(f"### 🎭 当前：{cfg['label']}阶段")
+            st.caption(f"🔊 音色样例（{cfg['label']}阶段的声音感觉）")
             try:
                 st.audio(cfg["voice"])
             except Exception:
-                pass
+                st.caption("（音色文件缺失）")
+        else:
+            # 非大家长成员：展示其照片，不做阶段切换
+            if target.get("photo"):
+                st.image(target["photo"], caption=f"{target['nickname']} · 数字人形象", width="stretch")
+            else:
+                st.info(f"👤 {target['nickname']}（尚未上传照片）")
+            st.markdown(f"### 🎭 {target['nickname']}")
+            st.caption(f"关系：{target['relationship']}")
+
+    with col_chat:
+        # 历史消息
+        for m in history:
+            with st.chat_message(m["role"]):
+                st.write(m["content"])
+                if m.get("stage") and target.get("is_elder"):
+                    st.caption(f"🎭 {STAGE_LABELS.get(m['stage'], '')}阶段")
+
+        prompt = st.chat_input(f"和 {target['nickname']} 聊聊吧…")
+
+        if prompt:
+            stage = detect_stage(prompt) if target.get("is_elder") else "elderly"
+            history.append({"role": "user", "content": prompt, "stage": stage})
+
+            msgs = [{"role": "system", "content": build_member_prompt(target, user_identity)}]
+            for m in history:
+                msgs.append({"role": m["role"], "content": m["content"]})
+
+            with st.chat_message("assistant"):
+                with st.spinner("正在回忆…"):
+                    try:
+                        reply = chat(msgs, api_key, model=model, base_url=base_url, temperature=st.session_state.temperature)
+                        st.session_state.last_warning = ""
+                    except Exception as e:
+                        reply = FALLBACK_REPLIES.get(stage, FALLBACK_REPLIES["elderly"])
+                        st.session_state.last_warning = f"⚠️ 演示模式（未成功连接模型）：{e}"
+            history.append({"role": "assistant", "content": reply, "stage": stage})
+            st.rerun()
+
+
+# ============================== 家族树 ======================================
+with tab_tree:
+    st.markdown("#### 家族数字记忆族谱（可编辑）")
+    st.caption("把家族成员都加进来；每位成员都能拥有自己的照片与人格，可被对话、可相互对话。")
+
+    # 添加成员表单
+    with st.expander("➕ 添加一位家族成员", expanded=False):
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            new_nick = st.text_input("称呼（如：建国）", key="new_nick")
+        with f2:
+            new_name = st.text_input("本名（如：王建国）", key="new_name")
+        with f3:
+            new_rel = st.text_input("与大家长的关系（如：大儿子）", key="new_rel")
+        with f4:
+            new_age = st.text_input("年龄", key="new_age")
+        new_memory = st.text_area("TA 的简要人生/性格（用于塑造 TA 自己的数字人，可留空）", key="new_memory", height=80)
+        new_photo = st.file_uploader("TA 的照片（可选）", type=["jpg", "jpeg", "png"], key="new_photo")
+        if st.button("✅ 添加成员", type="primary"):
+            if not new_nick.strip():
+                st.warning("请至少填写「称呼」")
+            elif member_by_nickname(new_nick.strip()):
+                st.warning("这个称呼已存在，请换一个")
+            else:
+                st.session_state.members.append({
+                    "id": st.session_state.next_member_id,
+                    "name": new_name.strip() or new_nick.strip(),
+                    "nickname": new_nick.strip(),
+                    "relationship": new_rel.strip() or "家属",
+                    "age": new_age.strip() or "",
+                    "photo": new_photo.getvalue() if new_photo else None,
+                    "memory": new_memory.strip(),
+                    "is_elder": False,
+                })
+                st.session_state.next_member_id += 1
+                st.rerun()
+
+    # 成员列表
+    for m in st.session_state.members:
+        with st.container(border=True):
+            c1, c2, c3 = st.columns([1, 3, 1])
+            with c1:
+                if m.get("photo"):
+                    st.image(m["photo"], width=120)
+                else:
+                    st.markdown(f"<div style='font-size:64px;line-height:1'>👤</div>", unsafe_allow_html=True)
+            with c2:
+                tag = "👴 大家长" if m.get("is_elder") else "👥 成员"
+                st.markdown(f"**{m['nickname']}** · {tag}")
+                st.caption(f"本名 {m['name']} ｜ 关系：{m['relationship']}" + (f" ｜ 年龄：{m['age']}" if m.get('age') else ""))
+                if m.get("memory"):
+                    st.caption(f"人格/记忆：{m['memory'][:80]}{'…' if len(m['memory']) > 80 else ''}")
+            with c3:
+                if not m.get("is_elder"):
+                    if st.button("🗑 删除", key=f"delmember_{m['id']}"):
+                        st.session_state.members = [x for x in st.session_state.members if x["id"] != m["id"]]
+                        st.rerun()
+
+    st.divider()
+    st.caption("💡 大家长（张奶奶）的身份与照片可在下方编辑；其他成员按需增删。")
+
+
+# ============================== 成员互聊 ====================================
+with tab_meet:
+    st.markdown("#### 家族成员相互对话")
+    st.caption("选择两位成员，生成一段他们之间的对话（各按各自身份与记忆说话）。")
+
+    if len(st.session_state.members) < 2:
+        st.info("请先到「家族树」添加至少一名家族成员，才能进行成员互聊。")
+    else:
+        nicks = [m["nickname"] for m in st.session_state.members]
+        m1, m2 = st.columns(2)
+        with m1:
+            a_nick = st.selectbox("成员 A", nicks, key="meet_a")
+        with m2:
+            b_opts = [n for n in nicks if n != a_nick]
+            b_nick = st.selectbox("成员 B", b_opts, key="meet_b")
+        topic = st.text_input("聊什么（可留空，AI 自定家常话题）", placeholder="例如：聊一聊小时候 / 聊聊孩子")
+
+        if st.button("🎬 生成对话", type="primary"):
+            a = member_by_nickname(a_nick)
+            b = member_by_nickname(b_nick)
+            topic_txt = f"，围绕话题「{topic}」" if topic.strip() else "，聊家常、聊往事"
+            meet_prompt = [
+                {"role": "system", "content": "你会扮演两位家庭成员，生成一段自然、有温度的对话。"},
+                {"role": "user", "content": (
+                    f"请生成 {a['nickname']} 与 {b['nickname']} 之间的对话{topic_txt}。\n"
+                    f"{a['nickname']}：{a['relationship']}，{a.get('memory') or '性格随和'}\n"
+                    f"{b['nickname']}：{b['relationship']}，{b.get('memory') or '性格随和'}\n"
+                    f"要求：各说 4~6 轮，语气贴合各自身份，口语化、有生活气息。"
+                    f"输出格式：每行以「称呼：内容」开头。"
+                )},
+            ]
+            with st.spinner("生成对话中…"):
+                try:
+                    dialog = chat(meet_prompt, api_key, model=model, base_url=base_url, max_tokens=1200, temperature=0.8)
+                except Exception as e:
+                    dialog = f"{a['nickname']}：{FALLBACK_REPLIES['elderly']}\n{b['nickname']}：是啊，一家人都平平安安就好。"
+                    st.warning(f"演示模式：{e}")
+            st.success(f"🎭 {a['nickname']} × {b['nickname']}")
+            st.markdown(dialog)
             st.download_button(
-                "⬇️ 下载寄语文本",
-                data=msg.encode("utf-8"),
-                file_name=f"寄语_{stage_label}.txt",
+                "⬇️ 下载对话文本",
+                data=dialog.encode("utf-8"),
+                file_name=f"对话_{a['nickname']}_{b['nickname']}.txt",
                 mime="text/plain",
             )
-            st.caption("🎬 视频生成与音色克隆为正式版功能（需接入 TTS 与数字人口型驱动）")
-
-
-# ----------------------------- 数字族谱 Tab -------------------------------
-with tab_tree:
-    st.markdown("#### 家族数字记忆族谱")
-    st.caption("以亲属关系为脉络，每位长辈对应一个数字生命节点")
-    try:
-        st.image("assets/family_tree.jpg", caption="家族数字族谱示意图", width="stretch")
-    except Exception:
-        st.info("（族谱示意图缺失）")
-
-    st.markdown("### 📌 功能说明")
-    st.write("- 每位长辈对应一个数字生命节点，可查看人生故事、留存影像、与数字人对话")
-    st.write("- 问起某个年龄段的事，自动切换到该阶段的形象与音色")
-    st.write("- 家族成员可共同补充记忆，实现代际文化传承")
