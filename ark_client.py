@@ -12,6 +12,7 @@
 import base64
 import json
 import re
+import struct
 import time
 import uuid
 
@@ -29,6 +30,10 @@ TTS_VOICES = {
     "男声·云舟": "zh_male_m191_uranus_bigtts",
 }
 DEFAULT_SPEAKER = "zh_female_vv_uranus_bigtts"
+
+# 豆包流式语音识别模型 2.0（seed-asr-2.0）
+ASR_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+ASR_RESOURCE_ID = "volc.seedasr.sauc.duration"
 
 # ---------------------------------------------------------------------------
 # 人生四阶段配置：label 用于展示，portrait/voice 对应 assets 里的素材文件
@@ -289,3 +294,102 @@ def tts(text, api_key, speaker=DEFAULT_SPEAKER, timeout=60, max_retries=3):
     if isinstance(last_err, RuntimeError):
         raise last_err
     raise RuntimeError(f"TTS 网络异常（已重试 {max_retries} 次）: {last_err}")
+
+
+def wav_to_pcm16k(wav_bytes):
+    """把 WAV 字节转成豆包 ASR 要求的 16kHz/16bit/单声道 原始 PCM。"""
+    import io as _io
+    import wave as _wave
+    import numpy as _np
+    with _wave.open(_io.BytesIO(wav_bytes), "rb") as wf:
+        sr = wf.getframerate()
+        nch = wf.getnchannels()
+        sw = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
+    if sw == 2:
+        audio = _np.frombuffer(frames, dtype=_np.int16)
+    elif sw == 1:
+        audio = (_np.frombuffer(frames, dtype=_np.uint8).astype(_np.int16) - 128) * 256
+    else:
+        raise ValueError(f"不支持的采样位深 {sw}")
+    if nch > 1:
+        audio = audio.reshape(-1, nch).mean(axis=1).astype(_np.int16)
+    if sr != 16000:
+        from scipy.signal import resample_poly
+        audio = resample_poly(audio.astype(_np.float32), 16000, sr).astype(_np.int16)
+    return audio.tobytes()
+
+
+def _asr_frame(msg_type, flags, serialization, compression, payload):
+    """构造豆包 ASR 二进制协议帧：4字节头 + 4字节 payload 长度 + payload。"""
+    return bytes([0x11, (msg_type << 4) | flags, (serialization << 4) | compression, 0x00]) \
+        + struct.pack(">I", len(payload)) + payload
+
+
+def _asr_extract_text(obj):
+    """从 ASR 响应 JSON 里提取识别文本（兼容 result 为 dict / list / payload_msg 等结构）。"""
+    payload = obj.get("payload_msg") or obj
+    result = payload.get("result")
+    if isinstance(result, dict):
+        if result.get("text"):
+            return result["text"]
+        result = result.get("utterances") or []
+    if isinstance(result, list):
+        return "".join(u.get("text", "") for u in result if isinstance(u, dict))
+    return ""
+
+
+def asr(pcm_bytes, api_key, resource_id=ASR_RESOURCE_ID, timeout=60):
+    """豆包流式语音识别 2.0：把 PCM(16k/16bit/mono) 转成文字。
+
+    采用「自动分配序列号」模式：完整客户端请求 + 音频分片 + 最后一帧(0b0010)。
+    返回识别文本；出错抛 RuntimeError。
+    """
+    if not api_key:
+        raise RuntimeError("未配置 ASR API Key")
+    import websocket as _ws
+
+    headers = {
+        "X-Api-Key": api_key,
+        "X-Api-Resource-Id": resource_id,
+        "X-Api-Request-Id": str(uuid.uuid4()),
+        "X-Api-Connect-Id": str(uuid.uuid4()),
+    }
+    ws = _ws.create_connection(ASR_URL, header=headers, timeout=timeout)
+    try:
+        cfg = {
+            "user": {"uid": "yinyinpu"},
+            "audio": {"format": "pcm", "rate": 16000, "bits": 16, "channel": 1},
+            "request": {"model_name": "bigmodel", "enable_punc": True},
+        }
+        ws.send_binary(_asr_frame(1, 0, 1, 0, json.dumps(cfg).encode()))  # 完整客户端请求
+        for i in range(0, len(pcm_bytes), 3200):                            # 音频分片
+            ws.send_binary(_asr_frame(2, 0, 0, 0, pcm_bytes[i:i + 3200]))
+        ws.send_binary(_asr_frame(2, 2, 0, 0, b""))                         # 最后一帧
+
+        final_text = ""
+        while True:
+            try:
+                msg = ws.recv()
+            except Exception:
+                break
+            obj = None
+            if isinstance(msg, (bytes, bytearray)):
+                s = msg.find(b"{")
+                if s >= 0:
+                    try:
+                        obj = json.loads(msg[s:].decode("utf-8", "ignore"))
+                    except Exception:
+                        obj = None
+            else:
+                try:
+                    obj = json.loads(msg)
+                except Exception:
+                    obj = None
+            if obj:
+                t = _asr_extract_text(obj)
+                if t:
+                    final_text = t  # 流式识别返回递增的完整文本，保留最新最全的
+        return final_text
+    finally:
+        ws.close()

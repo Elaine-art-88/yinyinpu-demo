@@ -20,6 +20,8 @@ __version__ = "1.2.0"  # 接入豆包语音合成 2.0（TTS 语音播报）
 from ark_client import (
     chat,
     tts,
+    asr,
+    wav_to_pcm16k,
     detect_stage,
     STAGES,
     build_system_prompt,
@@ -91,6 +93,13 @@ def get_base_url() -> str:
 def get_tts_key() -> str:
     try:
         return st.secrets.get("TTS_API_KEY", "")
+    except Exception:
+        return ""
+
+
+def get_asr_key() -> str:
+    try:
+        return st.secrets.get("ASR_API_KEY", "") or st.secrets.get("TTS_API_KEY", "")
     except Exception:
         return ""
 
@@ -240,13 +249,35 @@ with tab_mem:
                 st.caption("🔊 上面是 AI 用语音提出的问题")
 
         st.markdown("**② 老人语音回答**")
-        st.caption("老人点下方 🎤 录音说话，录音会保存并播放核对；自动转文字需开通「豆包语音识别(ASR)」。")
+        st.caption("老人点下方 🎤 录音说话，录音会自动转成文字（豆包语音识别 2.0）。")
         audio_file = st.audio_input("🎤 点击录音（老人直接说话）")
         if audio_file is not None:
-            st.audio(audio_file.getvalue(), format="audio/wav")
-            st.caption("✅ 已录到声音（可播放核对），请在下方把回答录入成文字")
+            audio_bytes = audio_file.getvalue()
+            st.audio(audio_bytes, format="audio/wav")
+            asr_key = get_asr_key() or tts_key
+            sig = len(audio_bytes)
+            if asr_key and st.session_state.get("_audio_sig") != sig:
+                st.session_state._audio_sig = sig
+                with st.spinner("正在识别语音…"):
+                    try:
+                        pcm = wav_to_pcm16k(audio_bytes)
+                        transcript = asr(pcm, asr_key)
+                        st.session_state.mem_answer = transcript.strip()
+                        st.session_state._asr_msg = ("ok", transcript.strip()) if transcript.strip() else ("empty", "")
+                    except Exception as e:
+                        st.session_state._asr_msg = ("err", str(e))
+            msg = st.session_state.get("_asr_msg")
+            if msg:
+                if msg[0] == "ok":
+                    st.success(f"✅ 识别结果：{msg[1]}")
+                elif msg[0] == "empty":
+                    st.warning("未识别到内容，请重试或手动输入")
+                else:
+                    st.warning(f"语音识别失败：{msg[1]}")
+            elif not asr_key:
+                st.info("未配置语音识别 Key，可手动录入文字")
 
-        answer = st.text_area("回答内容（当前需手动录入；开通语音识别后可自动转写）", key="mem_answer", height=140)
+        answer = st.text_area("回答内容（语音自动填入，可手动修改）", key="mem_answer", height=140)
 
         if st.button("💾 保存这段记忆", type="primary", width="stretch"):
             if answer.strip():
