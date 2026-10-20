@@ -1,0 +1,167 @@
+# -*- coding: utf-8 -*-
+"""
+忆音谱 · 跨年龄数字人 —— 豆包 character 模型接入与人生阶段识别。
+
+包含：
+1. 豆包(火山方舟) OpenAI 兼容接口的对话调用
+2. 人生四阶段(童年/青年/中年/老年)的关键词识别
+3. 默认人格设定与系统提示词构造
+4. 演示模式下的兜底回复
+"""
+
+import re
+import requests
+
+DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+DEFAULT_MODEL = "doubao-seed-character-260628"
+
+# ---------------------------------------------------------------------------
+# 人生四阶段配置：label 用于展示，portrait/voice 对应 assets 里的素材文件
+# ---------------------------------------------------------------------------
+STAGES = {
+    "childhood": {
+        "label": "童年",
+        "portrait": "assets/child.jpg",
+        "voice": "assets/voice_child.mp3",
+        "desc": "童年阶段 · 数字人形象",
+        "keywords": [
+            "小时候", "童年", "小学", "上学", "读书", "上学时", "幼儿园", "孩提",
+            "儿时", "少年", "孩子时", "老师", "同桌", "放牛", "挑水", "捡柴",
+            "过家家", "玩具", "糖果", "过年", "逃学", "捉迷藏", "山", "河里",
+            "田里", "背着书包", "启蒙",
+        ],
+    },
+    "youth": {
+        "label": "青年",
+        "portrait": "assets/young.jpg",
+        "voice": "assets/voice_young.mp3",
+        "desc": "青年阶段 · 数字人形象",
+        "keywords": [
+            "年轻", "青年", "工作", "上班", "进厂", "当兵", "参军", "结婚",
+            "恋爱", "对象", "二十", "三十", "学徒", "师傅", "打工", "下海",
+            "车间", "工厂", "初恋", "嫁", "娶", "成家", "毕业", "招工", "挣工分",
+        ],
+    },
+    "middle": {
+        "label": "中年",
+        "portrait": "assets/middle.jpg",
+        "voice": "assets/voice_middle.mp3",
+        "desc": "中年阶段 · 数字人形象",
+        "keywords": [
+            "中年", "四十", "五十", "创业", "买房", "养家", "下岗", "单位",
+            "事业", "带孩子", "供读书", "供孩子", "拉扯", "孩子还小",
+            "上有老下有小", "分房", "改革开放", "下海经商",
+        ],
+    },
+    "elderly": {
+        "label": "老年",
+        "portrait": "assets/old.jpg",
+        "voice": "assets/voice_old.mp3",
+        "desc": "老年阶段 · 数字人形象",
+        "keywords": [
+            "现在", "晚年", "退休", "养老", "孙子", "孙女", "外孙", "曾孙",
+            "重孙", "孙辈", "寄语", "希望", "愿望", "身体", "健康", "平安",
+            "老了", "年纪大", "以后", "如今", "现在呀", "这辈子", "长大了",
+            "牵挂", "放心不下",
+        ],
+    },
+}
+
+
+def detect_stage(text: str) -> str:
+    """根据用户的问题判断它问的是哪个年龄段，返回 STAGES 的键。
+
+    先做关键词匹配（阶段越靠前越优先），再用数字年龄粗判，最后默认回到老年阶段。
+    """
+    text = text or ""
+    for key in ("childhood", "youth", "middle", "elderly"):
+        cfg = STAGES[key]
+        for kw in cfg["keywords"]:
+            if kw in text:
+                return key
+
+    # 数字年龄粗判：如「你 25 岁的时候」「60 岁那年」
+    for m in re.finditer(r"(\d{1,3})\s*岁", text):
+        age = int(m.group(1))
+        if age < 12:
+            return "childhood"
+        if age < 30:
+            return "youth"
+        if age < 50:
+            return "middle"
+        return "elderly"
+
+    return "elderly"
+
+
+# ---------------------------------------------------------------------------
+# 默认人格与系统提示词
+# ---------------------------------------------------------------------------
+DEFAULT_STORY = (
+    "- 童年（贵州山村）：家里穷，上过几年小学，每天走五里山路去学校，放学还要放牛、挑水、捡柴火。"
+    "最开心的是过年能吃到一块肉。\n"
+    "- 青年（1950—60 年代）：二十岁进了县里纺织厂当学徒工，跟王师傅学技术，认识了后来的老伴，结婚生子，日子紧但有奔头。\n"
+    "- 中年（70—90 年代）：拉扯三个孩子长大，供他们读书，白天上班晚上做针线活，省吃俭用熬过了最难的岁月。\n"
+    "- 老年（现在）：退休在家，身体还算硬朗，喜欢和孙辈视频通话，最牵挂的就是一家人平安团圆。"
+)
+
+
+def build_system_prompt(persona: dict) -> str:
+    """根据人格设定构造系统提示词，让模型始终以该人物身份、口吻说话。"""
+    nick = persona.get("nickname") or persona.get("name") or "张奶奶"
+    name = persona.get("name") or nick
+    age = persona.get("age") or "80"
+    rel = persona.get("relationship") or "家属"
+    story = persona.get("story") or DEFAULT_STORY
+    return (
+        f"你是{nick}（本名{name}），今年{age}岁，是一位和蔼健谈、记性很好的老人。"
+        f"用户是你的{rel}，会来和你聊天，听你讲一生的故事。\n\n"
+        f"你的人生经历（聊到相应年代时请自然地引用这些细节）：\n{story}\n\n"
+        f"说话要求：\n"
+        f"- 第一人称、口语化、亲切自然，像真人聊天，不像念稿。\n"
+        f"- 可以带一点点质朴的方言味，但不难懂，爱用「那时候」「咱」「乖孙」这类词。\n"
+        f"- 每次回答 100～250 字左右，简短有温度。\n"
+        f"- 聊到某个年龄段的事，就自然地讲那个年代的细节、场景和感受。\n"
+        f"- 始终以「{nick}」的身份说话，不要跳出角色，不要说「我是 AI」。"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 兜底回复（无 Key 或调用失败时的演示模式）
+# ---------------------------------------------------------------------------
+FALLBACK_REPLIES = {
+    "childhood": "我小时候上学要走五里山路，天不亮就出发，书包是你太奶奶用碎布缝的……那时候虽然苦，但每天都特别开心。",
+    "youth": "我二十岁进了县里的纺织厂，当学徒工，跟着王师傅学技术。那时候干劲足，天天泡在车间里，也不觉得累。",
+    "middle": "中年那会儿最难的，就是拉扯几个孩子，白天上班晚上做针线活，就盼着孩子能把书读出来，别像我一样吃没文化的亏。",
+    "elderly": "现在啊，就希望家里人都平平安安，好好过日子，互相照应，把咱们家的本分一代代传下去……",
+}
+
+
+def chat(messages, api_key, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL,
+         temperature=0.7, max_tokens=800, timeout=60):
+    """调用豆包(火山方舟) OpenAI 兼容的 chat/completions 接口。
+
+    messages: [{"role": "system"|"user"|"assistant", "content": str}, ...]
+    返回模型生成的文本；出错时抛出 RuntimeError。
+    """
+    if not api_key:
+        raise RuntimeError("未配置 ARK_API_KEY")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    resp = requests.post(base_url, json=payload, headers=headers, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"API 返回 {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"API 返回结构异常: {e}")
