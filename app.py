@@ -15,6 +15,8 @@ import json
 
 import streamlit as st
 
+__version__ = "1.2.0"  # 接入豆包语音合成 2.0（TTS 语音播报）
+
 from ark_client import (
     chat,
     tts,
