@@ -17,12 +17,15 @@ import streamlit as st
 
 from ark_client import (
     chat,
+    tts,
     detect_stage,
     STAGES,
     build_system_prompt,
     FALLBACK_REPLIES,
     DEFAULT_MODEL,
     DEFAULT_BASE_URL,
+    TTS_VOICES,
+    DEFAULT_SPEAKER,
 )
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,20 @@ def get_base_url() -> str:
         return DEFAULT_BASE_URL
 
 
+def get_tts_key() -> str:
+    try:
+        return st.secrets.get("TTS_API_KEY", "")
+    except Exception:
+        return ""
+
+
+def get_tts_speaker() -> str:
+    try:
+        return st.secrets.get("TTS_SPEAKER", DEFAULT_SPEAKER)
+    except Exception:
+        return DEFAULT_SPEAKER
+
+
 def member_by_id(tid: int):
     for m in st.session_state.members:
         if m["id"] == tid:
@@ -137,6 +154,26 @@ with st.sidebar:
     if api_key:
         st.caption(f"模型：{model}")
         st.session_state.temperature = st.slider("回复温度", 0.0, 1.2, st.session_state.temperature)
+
+    # ---- 语音合成（TTS） ----
+    st.divider()
+    st.subheader("🔊 语音合成")
+    secret_tts_key = get_tts_key()
+    if secret_tts_key:
+        tts_key = secret_tts_key
+        st.success("✅ 已接入豆包语音合成 2.0")
+    else:
+        tts_key = st.text_input("TTS API Key（可选）", type="password", key="manual_tts_key")
+    if tts_key:
+        tts_enabled = st.toggle("开启语音播报", value=True, key="tts_enabled")
+        default_speaker = get_tts_speaker()
+        default_idx = list(TTS_VOICES.values()).index(default_speaker) if default_speaker in TTS_VOICES.values() else 0
+        speaker_label = st.selectbox("音色", list(TTS_VOICES.keys()), index=default_idx, key="tts_speaker")
+        speaker = TTS_VOICES[speaker_label]
+    else:
+        tts_enabled = False
+        speaker = DEFAULT_SPEAKER
+        st.caption("未配置 TTS，数字人将以文字回复")
 
     st.divider()
     st.markdown("**📌 使用流程**")
@@ -298,6 +335,8 @@ with tab_chat:
         for m in history:
             with st.chat_message(m["role"]):
                 st.write(m["content"])
+                if m.get("audio"):
+                    st.audio(m["audio"], format="audio/mp3")
                 if m.get("stage") and target.get("is_elder"):
                     st.caption(f"🎭 {STAGE_LABELS.get(m['stage'], '')}阶段")
 
@@ -311,6 +350,7 @@ with tab_chat:
             for m in history:
                 msgs.append({"role": m["role"], "content": m["content"]})
 
+            audio = None
             with st.chat_message("assistant"):
                 with st.spinner("正在回忆…"):
                     try:
@@ -319,7 +359,13 @@ with tab_chat:
                     except Exception as e:
                         reply = FALLBACK_REPLIES.get(stage, FALLBACK_REPLIES["elderly"])
                         st.session_state.last_warning = f"⚠️ 演示模式（未成功连接模型）：{e}"
-            history.append({"role": "assistant", "content": reply, "stage": stage})
+                if tts_enabled and tts_key and reply:
+                    with st.spinner("正在合成语音…"):
+                        try:
+                            audio = tts(reply, tts_key, speaker=speaker)
+                        except Exception as e:
+                            st.session_state.last_warning = f"{st.session_state.last_warning}\n⚠️ 语音合成失败：{e}"
+            history.append({"role": "assistant", "content": reply, "stage": stage, "audio": audio})
             st.rerun()
 
 

@@ -9,13 +9,26 @@
 4. 演示模式下的兜底回复
 """
 
+import base64
+import json
 import re
 import time
+import uuid
 
 import requests
 
 DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 DEFAULT_MODEL = "doubao-seed-character-260628"
+
+# 豆包语音合成模型 2.0（seed-tts-2.0）
+TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+TTS_RESOURCE_ID = "seed-tts-2.0"
+TTS_VOICES = {
+    "女声·Vivi": "zh_female_vv_uranus_bigtts",
+    "男声·刘飞": "zh_male_liufei_uranus_bigtts",
+    "男声·云舟": "zh_male_m191_uranus_bigtts",
+}
+DEFAULT_SPEAKER = "zh_female_vv_uranus_bigtts"
 
 # ---------------------------------------------------------------------------
 # 人生四阶段配置：label 用于展示，portrait/voice 对应 assets 里的素材文件
@@ -219,3 +232,60 @@ def chat(messages, api_key, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL,
     if isinstance(last_err, RuntimeError):
         raise last_err
     raise RuntimeError(f"网络异常（已重试 {max_retries} 次）: {last_err}")
+
+
+def tts(text, api_key, speaker=DEFAULT_SPEAKER, timeout=60, max_retries=3):
+    """调用豆包语音合成模型 2.0，把文字合成 MP3，返回音频字节。
+
+    走 V3 单向流式接口：响应为 NDJSON，逐行 code==0 的 data 为 base64 音频块，
+    code==20000000 为收尾标记。出错抛出 RuntimeError。
+    """
+    if not api_key:
+        raise RuntimeError("未配置 TTS_API_KEY")
+    headers = {
+        "X-Api-Key": api_key,
+        "X-Api-Resource-Id": TTS_RESOURCE_ID,
+        "X-Api-Request-Id": str(uuid.uuid4()),
+        "Content-Type": "application/json",
+    }
+    body = {
+        "user": {"uid": "yinyinpu_demo"},
+        "req_params": {
+            "text": text,
+            "speaker": speaker,
+            "audio_params": {"format": "mp3", "sample_rate": 24000},
+        },
+    }
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(TTS_URL, headers=headers, data=json.dumps(body), timeout=timeout)
+            if resp.status_code != 200:
+                raise RuntimeError(f"TTS HTTP {resp.status_code}: {resp.text[:200]}")
+            chunks = []
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                code = obj.get("code")
+                if code == 0:
+                    d = obj.get("data")
+                    if isinstance(d, str):
+                        chunks.append(d)
+                    elif isinstance(d, list):
+                        chunks.extend(d)
+            if not chunks:
+                raise RuntimeError(f"TTS 无音频返回: {resp.text[:200]}")
+            return base64.b64decode("".join(chunks))
+        except (requests.exceptions.RequestException, RuntimeError) as e:
+            last_err = e
+        if attempt < max_retries - 1:
+            time.sleep(1.0 * (attempt + 1))
+    if isinstance(last_err, RuntimeError):
+        raise last_err
+    raise RuntimeError(f"TTS 网络异常（已重试 {max_retries} 次）: {last_err}")
