@@ -49,7 +49,7 @@ def init_state():
             {
                 "id": 0, "name": "张秀兰", "nickname": "张奶奶",
                 "relationship": "大家长/母亲", "age": "80",
-                "photo": None, "memory": "", "is_elder": True,
+                "photo": None, "memory": "", "is_elder": True, "parent": None,
             }
         ],
         "next_member_id": 1,
@@ -326,6 +326,8 @@ with tab_mem:
                 d = json.loads(up.read())
                 st.session_state.memories = d.get("memories", [])
                 st.session_state.members = d.get("members", st.session_state.members)
+                for m in st.session_state.members:
+                    m.setdefault("parent", None)
                 ids = [m.get("id", 0) for m in st.session_state.members]
                 st.session_state.next_member_id = (max(ids) + 1) if ids else 1
                 st.rerun()
@@ -453,10 +455,59 @@ with tab_chat:
             st.rerun()
 
 
+def family_tree_html(members) -> str:
+    """根据成员列表 + parent 关系生成树形结构图 HTML（纯 HTML/CSS，无需外部依赖）。"""
+    ids = {m["id"] for m in members}
+    roots = [m for m in members if (m.get("parent") is None or m.get("parent") not in ids)]
+    root = roots[0] if roots else members[0]
+
+    children = {}
+    for m in members:
+        pid = m.get("parent")
+        if pid is None or pid not in ids or pid == m["id"]:
+            pid = root["id"] if m["id"] != root["id"] else None
+        if pid is not None:
+            children.setdefault(pid, []).append(m)
+
+    def node(m):
+        tag = "👴" if m.get("is_elder") else "👤"
+        rel = m.get("relationship") or ""
+        return (
+            f'<div class="tnode"><span class="te">{tag}</span>'
+            f'<span class="tn">{m["nickname"]}</span>'
+            f'<span class="tr">{rel}</span></div>'
+        )
+
+    def build(m):
+        html = "<li>" + node(m)
+        kids = children.get(m["id"], [])
+        if kids:
+            html += "<ul>" + "".join(build(k) for k in kids) + "</ul>"
+        return html + "</li>"
+
+    css = (
+        "<style>"
+        ".ftree,.ftree ul{list-style:none;margin:0;padding:0;font-family:sans-serif;}"
+        ".ftree ul{margin-left:26px;}"
+        ".ftree li{position:relative;padding:8px 0 8px 20px;}"
+        ".ftree li::before{content:'';position:absolute;left:0;top:26px;width:14px;height:1px;background:#d8c8b8;}"
+        ".ftree li::after{content:'';position:absolute;left:0;top:-8px;bottom:50%;width:1px;background:#d8c8b8;}"
+        ".ftree>li::before,.ftree>li::after{display:none;}"
+        ".tnode{display:inline-flex;align-items:center;gap:8px;border:1px solid #ead9c6;border-radius:20px;"
+        "padding:6px 14px;background:#fff8f0;box-shadow:0 1px 3px rgba(0,0,0,.06);}"
+        ".te{font-size:24px;}.tn{font-weight:600;color:#3a2e24;}.tr{font-size:12px;color:#a08a70;}"
+        "</style>"
+    )
+    return css + '<ul class="ftree">' + build(root) + "</ul>"
+
+
 # ============================== 家族树 ======================================
 with tab_tree:
     st.markdown("#### 家族数字记忆族谱（可编辑）")
-    st.caption("把家族成员都加进来；每位成员都能拥有自己的照片与人格，可被对话、可相互对话。")
+    st.caption("树形结构图；添加成员时选择「父节点」挂到树上，也可随时调整父节点。")
+
+    # 树形图
+    st.html(family_tree_html(st.session_state.members))
 
     # 添加成员表单
     with st.expander("➕ 添加一位家族成员", expanded=False):
@@ -466,11 +517,13 @@ with tab_tree:
         with f2:
             new_name = st.text_input("本名（如：王建国）", key="new_name")
         with f3:
-            new_rel = st.text_input("与大家长的关系（如：大儿子）", key="new_rel")
+            new_rel = st.text_input("关系（如：大儿子）", key="new_rel")
         with f4:
             new_age = st.text_input("年龄", key="new_age")
         new_memory = st.text_area("TA 的简要人生/性格（用于塑造 TA 自己的数字人，可留空）", key="new_memory", height=80)
         new_photo = st.file_uploader("TA 的照片（可选）", type=["jpg", "jpeg", "png"], key="new_photo")
+        parent_opts = [m["nickname"] for m in st.session_state.members]
+        new_parent = st.selectbox("父节点（挂在哪位家人下面）", parent_opts, index=0)
         if st.button("✅ 添加成员", type="primary"):
             if not new_nick.strip():
                 st.warning("请至少填写「称呼」")
@@ -486,11 +539,13 @@ with tab_tree:
                     "photo": new_photo.getvalue() if new_photo else None,
                     "memory": new_memory.strip(),
                     "is_elder": False,
+                    "parent": member_by_nickname(new_parent)["id"],
                 })
                 st.session_state.next_member_id += 1
                 st.rerun()
 
-    # 成员列表
+    # 成员列表（可改父节点 / 删除）
+    ids = {m["id"] for m in st.session_state.members}
     for m in st.session_state.members:
         with st.container(border=True):
             c1, c2, c3 = st.columns([1, 3, 1])
@@ -498,7 +553,7 @@ with tab_tree:
                 if m.get("photo"):
                     st.image(m["photo"], width=120)
                 else:
-                    st.markdown(f"<div style='font-size:64px;line-height:1'>👤</div>", unsafe_allow_html=True)
+                    st.markdown("<div style='font-size:56px;line-height:1'>👤</div>", unsafe_allow_html=True)
             with c2:
                 tag = "👴 大家长" if m.get("is_elder") else "👥 成员"
                 st.markdown(f"**{m['nickname']}** · {tag}")
@@ -507,12 +562,23 @@ with tab_tree:
                     st.caption(f"人格/记忆：{m['memory'][:80]}{'…' if len(m['memory']) > 80 else ''}")
             with c3:
                 if not m.get("is_elder"):
+                    parent_opts = [x["nickname"] for x in st.session_state.members if x["id"] != m["id"]]
+                    cur_pid = m.get("parent")
+                    cur_nick = member_by_id(cur_pid)["nickname"] if cur_pid in ids else parent_opts[0]
+                    sel = st.selectbox(
+                        "父节点", parent_opts,
+                        index=parent_opts.index(cur_nick) if cur_nick in parent_opts else 0,
+                        key=f"p_{m['id']}", label_visibility="collapsed",
+                    )
+                    if sel != cur_nick:
+                        m["parent"] = member_by_nickname(sel)["id"]
+                        st.rerun()
                     if st.button("🗑 删除", key=f"delmember_{m['id']}"):
                         st.session_state.members = [x for x in st.session_state.members if x["id"] != m["id"]]
                         st.rerun()
 
     st.divider()
-    st.caption("💡 大家长（张奶奶）的身份与照片可在下方编辑；其他成员按需增删。")
+    st.caption("💡 树形图随成员增删、父节点调整而自动更新。")
 
 
 # ============================== 成员互聊 ====================================
